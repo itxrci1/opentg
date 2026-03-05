@@ -231,7 +231,7 @@ async def generate_gemini_response(input_data, chat_history, user_id):
                 db.set(history_collection, f"chat_history.{user_id}", full_history)
             return bot_response
         except Exception as e:
-            if "429" in str(e) or "invalid" in str(e).lower():
+            if "429" in str(e) or "invalid" in str(e).lower() or "403" in str(e) or "suspended" in str(e).lower():
                 retries -= 1
                 current_key_index = (current_key_index + 1) % len(gemini_keys)
                 db.set(settings_collection, "current_key_index", current_key_index)
