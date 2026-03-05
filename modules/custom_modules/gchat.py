@@ -403,7 +403,7 @@ async def gchat(client: Client, message: Message):
                         await send_reply(message.reply_text, [bot_response], {}, client)
                     return
                 except Exception as e:
-                    if "429" in str(e) or "invalid" in str(e).lower():
+                    if "429" in str(e) or "invalid" in str(e).lower() or "403" in str(e) or "suspended" in str(e).lower():
                         retries -= 1
                         if retries % 2 == 0:
                             current_key_index = (current_key_index + 1) % len(gemini_keys)
