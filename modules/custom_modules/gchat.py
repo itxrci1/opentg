@@ -211,10 +211,34 @@ def build_prompt(bot_role, chat_history, user_message):
     )
     return prompt
 
-async def generate_gemini_response(input_data, chat_history, user_id):
+def _mask_key(key: str):
+    if not key:
+        return key
+    return (key[:12] + "...") if len(key) > 12 else key
+
+async def _notify_key_issue(client, index, key, err_text, notify_window_seconds=300):
+    if not client:
+        return
+    try:
+        last = db.get(settings_collection, f"key_notify.{index}") or 0
+        now = int(time.time())
+        if now - int(last) < notify_window_seconds:
+            # already notified recently
+            return
+        masked = _mask_key(key)
+        summary = err_text.splitlines()[0][:200]
+        msg = f"Gemini key #{index + 1} ({masked}) error: {summary}"
+        await send_reply(client.send_message, ["me", msg], {}, client)
+        db.set(settings_collection, f"key_notify.{index}", now)
+    except Exception:
+        # swallow notification errors
+        pass
+
+async def generate_gemini_response(input_data, chat_history, user_id, client=None):
     retries = 3
     gemini_keys = db.get(settings_collection, "gemini_keys") or [gemini_key]
     current_key_index = db.get(settings_collection, "current_key_index") or 0
+    last_exception = None
     while retries > 0:
         try:
             current_key = gemini_keys[current_key_index]
@@ -231,13 +255,31 @@ async def generate_gemini_response(input_data, chat_history, user_id):
                 db.set(history_collection, f"chat_history.{user_id}", full_history)
             return bot_response
         except Exception as e:
-            if "429" in str(e) or "invalid" in str(e).lower() or "403" in str(e) or "suspended" in str(e).lower():
+            last_exception = e
+            err_text = str(e)
+            lowered = err_text.lower()
+            # treat rate-limit, invalid keys, suspended/permission errors as key problems
+            if "429" in err_text or "invalid" in lowered or "403" in err_text or "suspended" in lowered or "permission denied" in lowered:
+                # notify owner (masked key) if client provided (rate-limited)
+                try:
+                    await _notify_key_issue(client, current_key_index, gemini_keys[current_key_index], err_text)
+                except Exception:
+                    pass
                 retries -= 1
-                current_key_index = (current_key_index + 1) % len(gemini_keys)
-                db.set(settings_collection, "current_key_index", current_key_index)
+                # rotate to next key and persist
+                try:
+                    current_key_index = (current_key_index + 1) % max(1, len(gemini_keys))
+                    db.set(settings_collection, "current_key_index", current_key_index)
+                except Exception:
+                    # fallback: continue trying the same key if rotation fails
+                    pass
                 await asyncio.sleep(4)
             else:
                 raise e
+    # if we exit loop without returning, raise the last exception
+    if last_exception:
+        raise last_exception
+    return ""
 
 async def upload_file_to_gemini(file_path, file_type):
     uploaded_file = await asyncio.to_thread(genai.upload_file, file_path)
@@ -318,7 +360,7 @@ async def handle_sticker_gif_buffered(client: Client, message: Message):
             prompt = build_prompt(bot_role, chat_history, "hello")
             await send_typing_action(client, message.chat.id, "hello")
             try:
-                bot_response = await generate_gemini_response(prompt, chat_history, user_id)
+                bot_response = await generate_gemini_response(prompt, chat_history, user_id, client)
                 if not bot_response:
                     await send_reply(client.send_message, ["me", f"Gemini returned empty response for user {user_id}"], {}, client)
                 else:
@@ -403,11 +445,21 @@ async def gchat(client: Client, message: Message):
                         await send_reply(message.reply_text, [bot_response], {}, client)
                     return
                 except Exception as e:
-                    if "429" in str(e) or "invalid" in str(e).lower() or "403" in str(e) or "suspended" in str(e).lower():
+                    err_text = str(e)
+                    lowered = err_text.lower()
+                    if "429" in err_text or "invalid" in lowered or "403" in err_text or "suspended" in lowered or "permission denied" in lowered:
+                        # notify about failing key (rate-limited) then rotate
+                        try:
+                            await _notify_key_issue(client, current_key_index, gemini_keys[current_key_index], err_text)
+                        except Exception:
+                            pass
                         retries -= 1
                         if retries % 2 == 0:
-                            current_key_index = (current_key_index + 1) % len(gemini_keys)
-                            db.set(settings_collection, "current_key_index", current_key_index)
+                            try:
+                                current_key_index = (current_key_index + 1) % len(gemini_keys)
+                                db.set(settings_collection, "current_key_index", current_key_index)
+                            except Exception:
+                                pass
                         await asyncio.sleep(4)
                     else:
                         await send_reply(client.send_message, ["me", f"gchat error:\n\n{str(e)}"], {}, client)
@@ -460,7 +512,7 @@ async def handle_files(client: Client, message: Message):
                             prompt_text = "User sent multiple images." + (f" Caption: {caption}" if caption else "")
                             prompt = build_prompt(bot_role, chat_history, prompt_text)
                             input_data = [prompt] + sample_images
-                            response = await generate_gemini_response(input_data, chat_history, user_id)
+                            response = await generate_gemini_response(input_data, chat_history, user_id, client)
                             if response and await handle_gpic_message(client, message.chat.id, response):
                                 return
                             if response and await handle_voice_message(client, message.chat.id, response):
@@ -509,7 +561,7 @@ async def handle_files(client: Client, message: Message):
             prompt = build_prompt(bot_role, chat_history, prompt_text)
             input_data = [prompt, uploaded_file]
             try:
-                response = await generate_gemini_response(input_data, chat_history, user_id)
+                response = await generate_gemini_response(input_data, chat_history, user_id, client)
             except Exception as e:
                 await send_reply(client.send_message, ["me", f"generate_gemini_response error:\n\n{str(e)}"], {}, client)
                 return
